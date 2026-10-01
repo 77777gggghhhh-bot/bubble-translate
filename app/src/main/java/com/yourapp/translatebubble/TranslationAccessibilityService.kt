@@ -116,7 +116,23 @@ class TranslationAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun collectText(node: AccessibilityNodeInfo?, out: MutableList<ScreenTextBlock>) {
+    // parentText: the text just added for this node's direct ancestor (if
+    // any), so a child that merely repeats it can be skipped instead of
+    // being recorded as a second, separate block. This is extremely common
+    // in real UI trees: a Button (or any clickable container) often has its
+    // OWN text/contentDescription set to exactly match its inner TextView's
+    // text, so both nodes pass the check below independently - without this,
+    // you get the same phrase translated and shown twice, stacked, for one
+    // single real button ("Start Floating Bubble" appearing doubled was
+    // exactly this). Only skips an EXACT match against the direct parent
+    // chain, so two unrelated sibling buttons that happen to share text
+    // (e.g. two different "Follow" buttons for two different people) are
+    // untouched - each still gets recorded once, correctly.
+    private fun collectText(
+        node: AccessibilityNodeInfo?,
+        out: MutableList<ScreenTextBlock>,
+        parentText: String? = null
+    ) {
         if (node == null) return
         if (!node.isVisibleToUser) {
             recycleChildren(node)
@@ -129,16 +145,18 @@ class TranslationAccessibilityService : AccessibilityService() {
             !contentDesc.isNullOrEmpty() -> contentDesc
             else -> null
         }
-        if (!combined.isNullOrEmpty()) {
+        var textForChildren = parentText
+        if (!combined.isNullOrEmpty() && combined != parentText) {
             val bounds = Rect()
             node.getBoundsInScreen(bounds)
             if (!bounds.isEmpty) {
                 out.add(ScreenTextBlock(combined, bounds))
             }
+            textForChildren = combined
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i)
-            collectText(child, out)
+            collectText(child, out, textForChildren)
             child?.recycle()
         }
     }
