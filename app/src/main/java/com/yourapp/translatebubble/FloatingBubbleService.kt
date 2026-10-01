@@ -416,15 +416,20 @@ class FloatingBubbleService : Service() {
     private fun normalizeOcrText(text: String): String =
         text.replace(Regex("\\s+"), " ").trim()
 
-    // Skip tiny icon-sized elements (like toolbar icon labels: "Edit",
-    // "Copy", "Share", "New") - real content is essentially never this
-    // small on screen, so this is almost always UI chrome, not something
-    // worth translating, and it's what made the overlay feel cluttered.
+    // Skip ONLY genuinely icon-button-sized elements (a toolbar icon's own
+    // tiny label, like "Edit" or "New" squeezed under/next to a 24-48dp
+    // icon). The previous thresholds (64dp both dimensions) were wrong:
+    // almost ANY single line of normal body text is under 64dp tall
+    // regardless of content, so legitimate short words (not just UI
+    // chrome) were being silently dropped - this is the bug behind
+    // short real words refusing to translate. A true icon label is small
+    // in BOTH dimensions at a much tighter bound (actual icon-button
+    // size), not just "one short line of text".
     private fun isLikelyIconChrome(block: ScreenTextBlock): Boolean {
         val text = block.text.trim()
         val w = block.bounds.width()
         val h = block.bounds.height()
-        return text.length <= 20 && w < dpToPx(64) && h < dpToPx(64)
+        return text.length <= 12 && w < dpToPx(40) && h < dpToPx(40)
     }
 
     // ---------------------------------------------------------------------
@@ -447,9 +452,22 @@ class FloatingBubbleService : Service() {
         "add a comment"
     )
 
+    // Dynamic UI labels that embed a username/name in the middle, so a
+    // fixed phrase list can never match them (e.g. "Go to Omikko12's
+    // profile", "View Omikko12's story") - seen verbatim in real debug
+    // logs leaking into translated output. Matched structurally instead
+    // of by exact text.
+    private val genericUiPatterns = listOf(
+        Regex("^go to .+'s profile$", RegexOption.IGNORE_CASE),
+        Regex("^view .+'s story$", RegexOption.IGNORE_CASE),
+        Regex("^.+'s profile picture$", RegexOption.IGNORE_CASE)
+    )
+
     private fun isLikelyGenericUiPhrase(text: String): Boolean {
         val cleaned = text.trim().lowercase()
-        if (cleaned.isEmpty() || cleaned.length > 40) return false
+        if (cleaned.isEmpty() || cleaned.length > 60) return false
+        if (genericUiPatterns.any { it.matches(cleaned) }) return true
+        if (cleaned.length > 40) return false
         return genericUiPhrases.any { phrase ->
             cleaned == phrase ||
                 // allow a short trailing bit (a count, a separator dot) but
