@@ -460,6 +460,31 @@ class FloatingBubbleService : Service() {
         }
     }
 
+    // Counts real words (whitespace-separated tokens) rather than raw
+    // characters - works the same for Arabic and Latin script, unlike
+    // relying on ML Kit's internal line/element split which isn't exposed
+    // on ScreenTextBlock (shared between OCR and Accessibility sources).
+    private fun wordCount(text: String): Int =
+        text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
+
+    // ---------------------------------------------------------------------
+    // General-purpose UI-label filter: catches navigation chrome that
+    // ISN'T in genericUiPhrases (any app, any language), instead of only
+    // ever growing that hand-written list. The rule is a property of the
+    // text, not its content: a single word in an icon-sized box is almost
+    // always a button label ("إرسال", "Compartir", "共有") - real sentences
+    // are virtually never both one token AND rendered that small.
+    // genericUiPhrases stays as a cheap fast-path for well-known phrases
+    // that AREN'T icon-sized (e.g. "Double tap to like" spans a wider row).
+    // ---------------------------------------------------------------------
+    private fun isLikelyUiLabel(block: ScreenTextBlock): Boolean {
+        val text = block.text.trim()
+        if (text.isEmpty()) return false
+        if (wordCount(text) >= 2) return false
+        if (text.length <= 12 && isLikelyIconChrome(block)) return true
+        return isLikelyGenericUiPhrase(text)
+    }
+
     // ---------------------------------------------------------------------
     // Accessibility often exposes one paragraph as several small text
     // nodes (one per line, or per sentence). Translating each separately
@@ -468,26 +493,57 @@ class FloatingBubbleService : Service() {
     // Lens shows. This merges vertically-stacked, left-aligned blocks back
     // into one block before translation.
     // ---------------------------------------------------------------------
-    private fun mergeAdjacentLines(blocks: List<ScreenTextBlock>): List<ScreenTextBlock> {
-        val sorted = blocks.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
-        val merged = mutableListOf<ScreenTextBlock>()
+    // ---------------------------------------------------------------------
+    // General spatial merge, replacing the old mergeAdjacentLines (which
+    // only ever merged Accessibility blocks, vertically, with matching
+    // left edges, BEFORE combining with OCR). This runs on the final
+    // combined OCR+Accessibility list, in any direction, so a sentence
+    // split between the two sources - or wrapped mid-word, or broken into
+    // side-by-side fragments on the same line - gets glued back into one
+    // block the way Google Lens groups a paragraph, instead of staying
+    // scattered. Union-Find clustering: two blocks are "the same
+    // paragraph" if their boxes (slightly expanded) touch or overlap.
+    // ---------------------------------------------------------------------
+    private fun mergeNearbyBlocks(blocks: List<ScreenTextBlock>): List<ScreenTextBlock> {
+        if (blocks.size <= 1) return blocks
+
         val vGap = dpToPx(6)
-        val leftTolerance = dpToPx(24)
+        val hGap = dpToPx(10)
+        val parent = IntArray(blocks.size) { it }
+        fun find(x: Int): Int {
+            var r = x
+            while (parent[r] != r) r = parent[r]
+            var c = x
+            while (parent[c] != c) { val next = parent[c]; parent[c] = r; c = next }
+            return r
+        }
+        fun union(a: Int, b: Int) {
+            val ra = find(a); val rb = find(b)
+            if (ra != rb) parent[ra] = rb
+        }
 
-        for (block in sorted) {
-            val last = merged.lastOrNull()
-            val sameParagraph = last != null &&
-                block.bounds.top - last.bounds.bottom in 0..vGap &&
-                abs(block.bounds.left - last.bounds.left) <= leftTolerance
-
-            if (sameParagraph && last != null) {
-                val union = android.graphics.Rect(last.bounds).apply { union(block.bounds) }
-                merged[merged.lastIndex] = ScreenTextBlock("${last.text} ${block.text}", union)
-            } else {
-                merged.add(block)
+        for (i in blocks.indices) {
+            val expanded = android.graphics.Rect(blocks[i].bounds).apply { inset(-hGap, -vGap) }
+            for (j in i + 1 until blocks.size) {
+                if (android.graphics.Rect.intersects(expanded, blocks[j].bounds)) {
+                    union(i, j)
+                }
             }
         }
-        return merged
+
+        val clusters = blocks.indices.groupBy { find(it) }
+        return clusters.values.map { indices ->
+            // Reading order within a cluster: top-to-bottom, then
+            // right-to-left for Arabic-leaning content vs left-to-right -
+            // approximate with top then left, which reads correctly for
+            // both since RTL text itself still renders right-aligned
+            // within its own line.
+            val ordered = indices.sortedWith(compareBy({ blocks[it].bounds.top }, { blocks[it].bounds.left }))
+            val text = ordered.joinToString(" ") { blocks[it].text }
+            val union = android.graphics.Rect(blocks[ordered.first()].bounds)
+            ordered.drop(1).forEach { union.union(blocks[it].bounds) }
+            ScreenTextBlock(text, union)
+        }
     }
 
     private fun sampleBackgroundColor(bitmap: Bitmap?, bounds: android.graphics.Rect): Int {
@@ -601,8 +657,11 @@ class FloatingBubbleService : Service() {
                 // the main thread was blocking the whole app - and
                 // occasionally made Android flag the accessibility
                 // service as unresponsive and silently turn it off.
+                // Raw blocks, unmerged - merging now happens once, later,
+                // on the combined OCR+Accessibility list (mergeNearbyBlocks)
+                // so fragments from BOTH sources can join the same cluster.
                 val accessibilityBlocks = withContext(Dispatchers.Default) {
-                    mergeAdjacentLines(accessibilityService.extractVisibleText())
+                    accessibilityService.extractVisibleText()
                 }
 
                 // Capture the screen once now (before any overlay is drawn
@@ -649,10 +708,15 @@ class FloatingBubbleService : Service() {
                     }
                 }
 
-                val limited = (ocrBlocks + accessibilityOnlyBlocks)
+                // Filter junk FIRST, then merge what's left. Filtering
+                // after merging would risk a real sentence silently
+                // absorbing an adjacent "Reply"/"Follow" label into its
+                // text instead of that label being dropped outright.
+                val cleaned = (ocrBlocks + accessibilityOnlyBlocks)
                     .filterNot { isLikelyJunkNumber(it.text) }
-                    .filterNot { isLikelyIconChrome(it) }
-                    .filterNot { isLikelyGenericUiPhrase(it.text) }
+                    .filterNot { isLikelyUiLabel(it) }
+
+                val limited = mergeNearbyBlocks(cleaned)
                     // If there's more than fits, keep the most substantive
                     // content (longer text) rather than whatever happened
                     // to come first in the screen's element order - a real
