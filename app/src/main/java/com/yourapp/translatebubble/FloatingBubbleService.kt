@@ -549,18 +549,45 @@ class FloatingBubbleService : Service() {
             }
         }
 
+        // Guard against chaining/snowballing: A-close-to-B and B-close-to-C
+        // puts A and C in the same cluster even when A and C themselves are
+        // far apart - on a dense screen (icon row + suggestion chips + a
+        // chat input bar, all packed within a few dp of each other) this
+        // can transitively glue the ENTIRE lower half of the screen into
+        // one "paragraph", producing one garbled block that swallows
+        // several unrelated buttons (seen for real: translated text piling
+        // up over the chat input row instead of sitting on each control).
+        // A real paragraph is never bigger than this on a phone screen, so
+        // any cluster that grows past it is almost certainly several
+        // unrelated elements chained together, not one real paragraph -
+        // leave those as separate, unmerged blocks instead of forcing a
+        // merge that makes them unreadable.
+        val maxMergedHeight = dpToPx(140)
+        val maxMergedWidth = dpToPx(380)
+
         val clusters = blocks.indices.groupBy { find(it) }
-        return clusters.values.map { indices ->
-            // Reading order within a cluster: top-to-bottom, then
-            // right-to-left for Arabic-leaning content vs left-to-right -
-            // approximate with top then left, which reads correctly for
-            // both since RTL text itself still renders right-aligned
-            // within its own line.
-            val ordered = indices.sortedWith(compareBy({ blocks[it].bounds.top }, { blocks[it].bounds.left }))
-            val text = ordered.joinToString(" ") { blocks[it].text }
-            val union = android.graphics.Rect(blocks[ordered.first()].bounds)
-            ordered.drop(1).forEach { union.union(blocks[it].bounds) }
-            ScreenTextBlock(text, union)
+        return clusters.values.flatMap { indices ->
+            if (indices.size == 1) {
+                return@flatMap listOf(blocks[indices.first()])
+            }
+            val union = android.graphics.Rect(blocks[indices.first()].bounds)
+            indices.drop(1).forEach { union.union(blocks[it].bounds) }
+
+            if (union.height() > maxMergedHeight || union.width() > maxMergedWidth) {
+                // Too big to be one real paragraph - fall back to the
+                // original, unmerged blocks rather than one oversized,
+                // garbled cluster.
+                indices.map { blocks[it] }
+            } else {
+                // Reading order within a cluster: top-to-bottom, then
+                // right-to-left for Arabic-leaning content vs left-to-right
+                // - approximate with top then left, which reads correctly
+                // for both since RTL text itself still renders
+                // right-aligned within its own line.
+                val ordered = indices.sortedWith(compareBy({ blocks[it].bounds.top }, { blocks[it].bounds.left }))
+                val text = ordered.joinToString(" ") { blocks[it].text }
+                listOf(ScreenTextBlock(text, union))
+            }
         }
     }
 
