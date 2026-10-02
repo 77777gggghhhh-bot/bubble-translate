@@ -373,11 +373,29 @@ class FloatingBubbleService : Service() {
     // (ML Kit has no Arabic OCR model), which covers the common case of
     // English meme text needing translation.
     // ---------------------------------------------------------------------
+    // The system status bar (clock, battery, signal/network icons) always
+    // ends up in the raw screenshot and ML Kit will happily try to "read"
+    // those tiny icons as text, producing pure garbage ("O24,0 | KB/S
+    // LTED I 45" from the battery/network indicators - confirmed straight
+    // from a real debug log) that then pollutes a real block it happens to
+    // sit near. It is never useful content, so it's cropped out before OCR
+    // ever sees it rather than trying to filter the garbage after the fact.
+    private fun statusBarHeightPx(): Int {
+        val resId = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resId > 0) resources.getDimensionPixelSize(resId) else dpToPx(24)
+    }
+
     private suspend fun runOcr(bitmap: Bitmap): List<ScreenTextBlock> =
         suspendCancellableCoroutine { cont ->
             try {
+                val cropTop = statusBarHeightPx().coerceIn(0, bitmap.height - 1)
+                val ocrBitmap = if (cropTop > 0) {
+                    Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, bitmap.height - cropTop)
+                } else {
+                    bitmap
+                }
                 val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                val image = InputImage.fromBitmap(bitmap, 0)
+                val image = InputImage.fromBitmap(ocrBitmap, 0)
                 recognizer.process(image)
                     .addOnSuccessListener { visionText ->
                         val blocks = mutableListOf<ScreenTextBlock>()
@@ -385,6 +403,11 @@ class FloatingBubbleService : Service() {
                             val text = normalizeOcrText(block.text)
                             val bounds = block.boundingBox
                             if (text.isNotEmpty() && bounds != null && !bounds.isEmpty) {
+                                // Shift bounds back down by the cropped
+                                // amount so they still line up with the
+                                // real, uncropped screen when the overlay
+                                // is placed.
+                                bounds.offset(0, cropTop)
                                 blocks.add(ScreenTextBlock(text, bounds))
                             }
                         }
@@ -526,7 +549,7 @@ class FloatingBubbleService : Service() {
         if (blocks.size <= 1) return blocks
 
         val vGap = dpToPx(6)
-        val hGap = dpToPx(10)
+        val hGap = dpToPx(14)
         val parent = IntArray(blocks.size) { it }
         fun find(x: Int): Int {
             var r = x
@@ -540,30 +563,58 @@ class FloatingBubbleService : Service() {
             if (ra != rb) parent[ra] = rb
         }
 
+        // Two explicit, directional cases instead of one uniform "expand
+        // every box a bit and see what touches" rule - that uniform rule
+        // is what let an unrelated icon row chain transitively into a
+        // paragraph two messages ago. Both real cases below require
+        // genuine overlap along one axis, which a stray nearby icon
+        // essentially never has:
+        fun overlapLen(aStart: Int, aEnd: Int, bStart: Int, bEnd: Int): Int =
+            minOf(aEnd, bEnd) - maxOf(aStart, bStart)
+
+        fun shouldMerge(a: android.graphics.Rect, b: android.graphics.Rect): Boolean {
+            // Case 1 - same line, fragmented: the two boxes occupy
+            // basically the same vertical band (one word next to
+            // another, or one word OCR'd as two pieces) and are
+            // horizontally close.
+            val vOverlap = overlapLen(a.top, a.bottom, b.top, b.bottom)
+            val minHeight = minOf(a.height(), b.height())
+            val sameLine = minHeight > 0 && vOverlap > minHeight / 2
+            val hGapBetween = maxOf(a.left, b.left) - minOf(a.right, b.right)
+            if (sameLine && hGapBetween <= hGap) return true
+
+            // Case 2 - stacked paragraph lines: meaningfully overlapping
+            // horizontal span (same text column - this is what a real
+            // wrapped paragraph looks like) and a small vertical gap. An
+            // icon row or a scattered chip is essentially never aligned
+            // to the SAME horizontal column as unrelated text above or
+            // below it, so this stays safe without needing a size cap to
+            // do the real work.
+            val hOverlap = overlapLen(a.left, a.right, b.left, b.right)
+            val minWidth = minOf(a.width(), b.width())
+            val sameColumn = minWidth > 0 && hOverlap > minWidth * 2 / 5
+            val vGapBetween = maxOf(a.top, b.top) - minOf(a.bottom, b.bottom)
+            if (sameColumn && vGapBetween in 0..vGap) return true
+
+            return false
+        }
+
         for (i in blocks.indices) {
-            val expanded = android.graphics.Rect(blocks[i].bounds).apply { inset(-hGap, -vGap) }
             for (j in i + 1 until blocks.size) {
-                if (android.graphics.Rect.intersects(expanded, blocks[j].bounds)) {
+                if (shouldMerge(blocks[i].bounds, blocks[j].bounds)) {
                     union(i, j)
                 }
             }
         }
 
-        // Guard against chaining/snowballing: A-close-to-B and B-close-to-C
-        // puts A and C in the same cluster even when A and C themselves are
-        // far apart - on a dense screen (icon row + suggestion chips + a
-        // chat input bar, all packed within a few dp of each other) this
-        // can transitively glue the ENTIRE lower half of the screen into
-        // one "paragraph", producing one garbled block that swallows
-        // several unrelated buttons (seen for real: translated text piling
-        // up over the chat input row instead of sitting on each control).
-        // A real paragraph is never bigger than this on a phone screen, so
-        // any cluster that grows past it is almost certainly several
-        // unrelated elements chained together, not one real paragraph -
-        // leave those as separate, unmerged blocks instead of forcing a
-        // merge that makes them unreadable.
-        val maxMergedHeight = dpToPx(140)
-        val maxMergedWidth = dpToPx(380)
+        // Now a secondary safety net rather than the primary defense (the
+        // two directional checks above do the real work): a real, even
+        // very long, paragraph legitimately needs to merge across dozens
+        // of lines (the ChatGPT test paragraph alone is 300dp+ tall), so
+        // this is sized generously and is here only to stop a genuinely
+        // pathological chain, not ordinary long paragraphs.
+        val maxMergedHeight = dpToPx(700)
+        val maxMergedWidth = dpToPx(420)
 
         val clusters = blocks.indices.groupBy { find(it) }
         return clusters.values.flatMap { indices ->
