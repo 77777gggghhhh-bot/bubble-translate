@@ -887,14 +887,36 @@ class FloatingBubbleService : Service() {
             // Arabic translation, and forcing that width makes the text
             // wrap into an ugly single-letter-per-line vertical stack.
             val maxWidth = (screenWidth - block.bounds.left - dpToPx(8)).coerceAtLeast(dpToPx(60))
+            // Full in-place replacement, the way Google Lens does it, means
+            // this box must NEVER be smaller than the area it's replacing -
+            // only WRAP_CONTENT (no minWidth/minHeight) was set before, so
+            // whenever the translation measured narrower or shorter than
+            // the original (Arabic is very often MORE COMPACT than
+            // English for the same sentence), the box shrank to fit the
+            // translation and left a sliver of the original text exposed
+            // on the edge. Pinning both to at least the original block's
+            // size guarantees full coverage regardless of which direction
+            // the translation differs in length; maxWidth still lets it
+            // grow wider when the translation genuinely needs more room.
+            val minWidth = block.bounds.width().coerceAtMost(maxWidth)
+            val minHeight = block.bounds.height()
             val label = TextView(this).apply {
                 text = translated
                 setTextColor(readableTextColorFor(backgroundColor))
                 setBackgroundColor(backgroundColor) // blends into the real background instead of a plain white box
                 textSize = autoTextSizeSp(translated) * scale
                 setPadding(10, 4, 10, 4)
-                maxLines = 2
+                // No maxLines cap: a translation (Arabic especially) is
+                // often MORE lines than the original once word-wrapped at
+                // this width, and capping at 2 silently cut off everything
+                // past that - a whole paragraph's translation was ending
+                // mid-sentence with the rest of the original English just
+                // left showing underneath it, uncovered. WRAP_CONTENT
+                // height below now grows to fit however many lines the
+                // real translated text needs, same as Google Lens does.
                 this.maxWidth = maxWidth
+                this.minWidth = minWidth
+                this.minHeight = minHeight
             }
 
             val params = WindowManager.LayoutParams(
