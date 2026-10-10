@@ -373,13 +373,20 @@ class FloatingBubbleService : Service() {
     // (ML Kit has no Arabic OCR model), which covers the common case of
     // English meme text needing translation.
     // ---------------------------------------------------------------------
-    // The system status bar (clock, battery, signal/network icons) always
-    // ends up in the raw screenshot and ML Kit will happily try to "read"
-    // those tiny icons as text, producing pure garbage ("O24,0 | KB/S
-    // LTED I 45" from the battery/network indicators - confirmed straight
-    // from a real debug log) that then pollutes a real block it happens to
-    // sit near. It is never useful content, so it's cropped out before OCR
-    // ever sees it rather than trying to filter the garbage after the fact.
+    // The system status bar (clock, battery, signal/network icons)
+    // produces garbage OCR text ("O24,0 | KB/S LTED I 45" - confirmed from
+    // a real debug log) that's never useful to translate. The previous
+    // approach cropped the BITMAP before OCR and then offset the
+    // resulting coordinates back down - but that makes every single
+    // OCR block's position depend on this device correctly reporting its
+    // own status bar height, and on OEM skins (this device is a
+    // heavily-customized ColorOS build) that value can be wrong, which
+    // would silently shift EVERY OCR overlay away from the real text
+    // underneath it - a far worse problem than a few garbage blocks.
+    // Filtering AFTER running OCR on the full, untouched bitmap keeps the
+    // coordinate system simple and guaranteed-correct (OCR coordinates
+    // always match the real screen 1:1, zero offset math involved) and
+    // still removes the exact same garbage blocks.
     private fun statusBarHeightPx(): Int {
         val resId = resources.getIdentifier("status_bar_height", "dimen", "android")
         return if (resId > 0) resources.getDimensionPixelSize(resId) else dpToPx(24)
@@ -388,26 +395,18 @@ class FloatingBubbleService : Service() {
     private suspend fun runOcr(bitmap: Bitmap): List<ScreenTextBlock> =
         suspendCancellableCoroutine { cont ->
             try {
-                val cropTop = statusBarHeightPx().coerceIn(0, bitmap.height - 1)
-                val ocrBitmap = if (cropTop > 0) {
-                    Bitmap.createBitmap(bitmap, 0, cropTop, bitmap.width, bitmap.height - cropTop)
-                } else {
-                    bitmap
-                }
+                val statusBarBottom = statusBarHeightPx()
                 val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                val image = InputImage.fromBitmap(ocrBitmap, 0)
+                val image = InputImage.fromBitmap(bitmap, 0)
                 recognizer.process(image)
                     .addOnSuccessListener { visionText ->
                         val blocks = mutableListOf<ScreenTextBlock>()
                         for (block in visionText.textBlocks) {
                             val text = normalizeOcrText(block.text)
                             val bounds = block.boundingBox
-                            if (text.isNotEmpty() && bounds != null && !bounds.isEmpty) {
-                                // Shift bounds back down by the cropped
-                                // amount so they still line up with the
-                                // real, uncropped screen when the overlay
-                                // is placed.
-                                bounds.offset(0, cropTop)
+                            if (text.isNotEmpty() && bounds != null && !bounds.isEmpty &&
+                                bounds.top >= statusBarBottom
+                            ) {
                                 blocks.add(ScreenTextBlock(text, bounds))
                             }
                         }
@@ -616,10 +615,26 @@ class FloatingBubbleService : Service() {
         val maxMergedHeight = dpToPx(700)
         val maxMergedWidth = dpToPx(420)
 
+        // A grid layout (home screen app icons, a photo grid, anything in
+        // rows AND columns) defeats the directional checks above in a way
+        // a paragraph never does: each cell is genuinely "same line" with
+        // its row neighbors AND genuinely "same column" with the cells
+        // above/below it, so Union-Find chains the ENTIRE grid into one
+        // cluster even though every individual pairwise merge was locally
+        // justified - confirmed for real: a home screen's ~20-30 icon
+        // labels all fused into one unreadable block covering the whole
+        // screen. A real paragraph is rarely more than a dozen or so
+        // merged fragments even when long, so a cluster bigger than that
+        // is almost certainly a grid, not prose.
+        val maxMergedBlockCount = 12
+
         val clusters = blocks.indices.groupBy { find(it) }
         return clusters.values.flatMap { indices ->
             if (indices.size == 1) {
                 return@flatMap listOf(blocks[indices.first()])
+            }
+            if (indices.size > maxMergedBlockCount) {
+                return@flatMap indices.map { blocks[it] }
             }
             val union = android.graphics.Rect(blocks[indices.first()].bounds)
             indices.drop(1).forEach { union.union(blocks[it].bounds) }
