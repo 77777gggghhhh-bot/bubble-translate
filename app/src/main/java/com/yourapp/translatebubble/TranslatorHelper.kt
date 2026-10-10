@@ -42,6 +42,12 @@ class TranslatorHelper {
         }
     }
 
+    // Signals "leave this block alone" rather than a real translation
+    // failure - the caller already treats any failure as "skip, don't
+    // show an overlay for this block" (via Result.getOrNull()), so this
+    // reuses that same path instead of needing a new one.
+    private class SkipTranslation : Exception("Arabic source, one-directional mode: left untouched")
+
     // ---------------------------------------------------------------------
     // Translate many blocks at once, a few at a time in parallel, instead
     // of one-by-one. Much faster when a screen has lots of text blocks.
@@ -58,13 +64,30 @@ class TranslatorHelper {
     suspend fun translateBatch(
         texts: List<String>,
         maxConcurrent: Int = 4,
-        forcedDirection: Boolean? = null // null = auto-detect per block; true = force Arabic->English; false = force English->Arabic
+        forcedDirection: Boolean? = null // null = auto-detect per block, one-directional (English/other -> Arabic only; Arabic source is left untouched, not translated to English); true = force Arabic->English; false = force English->Arabic
     ): List<Result<String>> = coroutineScope {
         val semaphore = Semaphore(maxConcurrent)
         texts.map { text ->
             async {
                 semaphore.withPermit {
-                    translate(text, arabicToEnglish = forcedDirection ?: isArabicDominant(text))
+                    when (forcedDirection) {
+                        // Explicit user choice always wins, including an
+                        // explicit request for Arabic->English.
+                        true -> translate(text, arabicToEnglish = true)
+                        false -> translate(text, arabicToEnglish = false)
+                        // Auto-detect: only ever translate INTO Arabic.
+                        // An Arabic-dominant block is already in the
+                        // target language, so it's skipped rather than
+                        // run through arToEn - matching Google Lens set
+                        // to "English -> Arabic", which leaves Arabic
+                        // source text on screen untouched instead of
+                        // flipping it into English.
+                        null -> if (isArabicDominant(text)) {
+                            Result.failure(SkipTranslation())
+                        } else {
+                            translate(text, arabicToEnglish = false)
+                        }
+                    }
                 }
             }
         }.awaitAll()
