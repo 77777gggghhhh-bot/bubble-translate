@@ -37,6 +37,8 @@ import androidx.core.app.NotificationCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -130,17 +132,64 @@ class FloatingBubbleService : Service() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(actionReceiver, filter)
         }
+
+        TranslationAccessibilityService.onForegroundScreenChanged = { onForegroundScreenChanged() }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         runCatching { unregisterReceiver(actionReceiver) }
+        if (TranslationAccessibilityService.onForegroundScreenChanged != null) {
+            TranslationAccessibilityService.onForegroundScreenChanged = null
+        }
         removeWordOverlay()
         bubbleView?.let { runCatching { windowManager.removeView(it) } }
         translatorHelper.close()
         tts?.stop()
         tts?.shutdown()
         serviceJob.cancel()
+    }
+
+    // "Foreign text detected" nudge - a cheap, Accessibility-only pass
+    // (no screenshot, no OCR, so it's safe to run on every screen change)
+    // that checks whether the screen the user just landed on has a
+    // meaningful amount of non-Arabic text, and if so gives the bubble a
+    // quick pulse to invite a tap - instead of translation only ever
+    // happening when the user remembers to check manually.
+    private var lastNudgeCheckAt = 0L
+    private val nudgeCheckCooldownMs = 2500L
+    private val minNudgeChars = 24
+
+    private fun onForegroundScreenChanged() {
+        val now = System.currentTimeMillis()
+        if (now - lastNudgeCheckAt < nudgeCheckCooldownMs) return
+        if (overlayIsShowing) return // don't nudge over an active translation
+        lastNudgeCheckAt = now
+
+        val accessibilityService = TranslationAccessibilityService.instance ?: return
+        serviceScope.launch {
+            val blocks = withContext(Dispatchers.Default) {
+                runCatching { accessibilityService.extractVisibleText() }.getOrDefault(emptyList())
+            }
+            val translatableChars = blocks
+                .filterNot { translatorHelper.isArabicDominant(it.text) }
+                .sumOf { it.text.length }
+            if (translatableChars >= minNudgeChars) {
+                pulseBubble()
+            }
+        }
+    }
+
+    private fun pulseBubble() {
+        val bubble = bubbleView ?: return
+        bubble.animate()
+            .scaleX(1.3f).scaleY(1.3f)
+            .setDuration(260L)
+            .setInterpolator(android.view.animation.OvershootInterpolator(2f))
+            .withEndAction {
+                bubble.animate().scaleX(1f).scaleY(1f).setDuration(200L).start()
+            }
+            .start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -282,6 +331,7 @@ class FloatingBubbleService : Service() {
         var initialTouchY = 0f
         var longPressTriggered = false
         var wasDragged = false
+        var lastBubbleTapTime = 0L
         val longPressRunnable = Runnable {
             longPressTriggered = true
             onLongPressStop()
@@ -319,7 +369,16 @@ class FloatingBubbleService : Service() {
                         val isTap = dx < CLICK_DRAG_THRESHOLD && dy < CLICK_DRAG_THRESHOLD
                         if (isTap) {
                             vibrateTick() // feel the tap immediately, before any work happens
-                            onBubbleClicked()
+                            val now = System.currentTimeMillis()
+                            // Double-tap the BUBBLE (not a translated label)
+                            // = export a full debug snapshot instead of a
+                            // normal translate. Doesn't delay the single-tap
+                            // translate at all - that already fired above;
+                            // this only changes what the SECOND quick tap
+                            // does.
+                            val isDoubleTap = now - lastBubbleTapTime < DOUBLE_TAP_MS
+                            lastBubbleTapTime = now
+                            onBubbleClicked(exportSnapshot = isDoubleTap)
                         } else if (wasDragged) {
                             snapBubbleToNearestEdge()
                         }
@@ -725,7 +784,89 @@ class FloatingBubbleService : Service() {
     // showing a toast, since re-enabling it there is the actual fix.
     // ---------------------------------------------------------------------
 
-    private fun onBubbleClicked() {
+    // ---------------------------------------------------------------------
+    // Diagnostic export: double-tap the bubble (not a translated label -
+    // the bubble itself) to copy a full, structured, UNTRUNCATED snapshot
+    // of this translate pass to the clipboard as JSON: every accessibility
+    // and OCR block's full text and exact coordinates, which ones got
+    // filtered and why, and what the final shown result was for each.
+    // The existing "Last crash" log only ever showed the first 5 blocks
+    // truncated to 40 characters with no coordinates at all - good enough
+    // to tell SOMETHING happened, useless for pinning down exactly why a
+    // specific merge or filter decision went wrong. Paste the clipboard
+    // content straight into a chat with Claude, or into
+    // debug_snapshot_viewer.html, for an exact, visual block-by-block
+    // breakdown instead of guessing from a screenshot of this screen.
+    // ---------------------------------------------------------------------
+    private fun blockJson(block: ScreenTextBlock): JSONObject =
+        JSONObject()
+            .put("text", block.text)
+            .put("bounds", intArrayOf(block.bounds.left, block.bounds.top, block.bounds.right, block.bounds.bottom).joinToString(","))
+
+    private fun exportDebugSnapshot(
+        accessibilityService: TranslationAccessibilityService,
+        screenshot: Bitmap?,
+        accessibilityBlocks: List<ScreenTextBlock>,
+        ocrBlocks: List<ScreenTextBlock>,
+        accessibilityOnlyBlocks: List<ScreenTextBlock>,
+        limited: List<ScreenTextBlock>,
+        translatedBlocks: List<Pair<ScreenTextBlock, String>>
+    ) {
+        runCatching {
+            val snapshot = JSONObject()
+            snapshot.put("screen_px", "${screenshot?.width ?: 0}x${screenshot?.height ?: 0}")
+
+            val axArr = JSONArray()
+            accessibilityBlocks.forEach { axArr.put(blockJson(it)) }
+            snapshot.put("accessibility_raw", axArr)
+
+            val ocrArr = JSONArray()
+            ocrBlocks.forEach { ocrArr.put(blockJson(it)) }
+            snapshot.put("ocr_raw", ocrArr)
+
+            // Same predicates the real pipeline uses, re-applied here only
+            // to LABEL why each one was dropped - doesn't change what gets
+            // filtered, just explains it.
+            val filteredArr = JSONArray()
+            (ocrBlocks + accessibilityOnlyBlocks).forEach { b ->
+                val reason = when {
+                    isLikelyJunkNumber(b.text) -> "junk_number"
+                    isLikelyUiLabel(b) -> "ui_label"
+                    else -> null
+                }
+                if (reason != null) filteredArr.put(blockJson(b).put("reason", reason))
+            }
+            snapshot.put("filtered_out", filteredArr)
+
+            val finalArr = JSONArray()
+            limited.forEach { b ->
+                val obj = blockJson(b)
+                val match = translatedBlocks.firstOrNull { it.first === b }
+                if (match != null) {
+                    obj.put("translated", match.second)
+                } else {
+                    // Didn't fail - this is now the expected outcome for
+                    // an Arabic-dominant block in auto-detect mode (left
+                    // untouched on purpose), or a genuine translate error.
+                    obj.put("skipped", "arabic_source_or_translate_error")
+                }
+                finalArr.put(obj)
+            }
+            snapshot.put("final_blocks", finalArr)
+
+            val jsonString = snapshot.toString()
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("Translate Bubble debug snapshot", jsonString))
+            accessibilityService.log(
+                "Debug snapshot: ${jsonString.length} chars copied to clipboard " +
+                    "(ax=${accessibilityBlocks.size}, ocr=${ocrBlocks.size}, filtered=${filteredArr.length()}, final=${limited.size}) " +
+                    "- paste into chat or debug_snapshot_viewer.html"
+            )
+            Toast.makeText(this, "Debug snapshot copied - paste it anywhere", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun onBubbleClicked(exportSnapshot: Boolean = false) {
         if (overlayIsShowing) {
             removeWordOverlay()
             setBubbleColor(COLOR_IDLE)
@@ -853,6 +994,13 @@ class FloatingBubbleService : Service() {
                     result.getOrNull()?.let { translated -> block to translated }
                 }
 
+                if (exportSnapshot) {
+                    exportDebugSnapshot(
+                        accessibilityService, screenshot, accessibilityBlocks, ocrBlocks,
+                        accessibilityOnlyBlocks, limited, translatedBlocks
+                    )
+                }
+
                 if (translatedBlocks.isNotEmpty()) {
                     showWordOverlay(translatedBlocks, screenshot)
                     true
@@ -894,7 +1042,21 @@ class FloatingBubbleService : Service() {
 
         val scale = textSizeScale()
         val screenWidth = resources.displayMetrics.widthPixels
-        for ((block, translated) in items) {
+        // Staggered reveal: every label used to just pop in all at once,
+        // instantly, the moment translation finished - functional, but
+        // forgettable to watch. Revealing top-to-bottom in a quick wave
+        // instead turns the exact same result into the kind of moment
+        // that looks great in a screen recording (the whole screen visibly
+        // "transforming" rather than just switching), which is exactly
+        // what a short demo clip needs to be worth sharing. Capped total
+        // spread so a busy screen with many blocks still finishes
+        // revealing quickly rather than feeling sluggish.
+        val orderedItems = items.sortedWith(compareBy({ it.first.bounds.top }, { it.first.bounds.left }))
+        val staggerStepMs = 35L
+        val maxStaggerMs = 450L
+        for ((index, pair) in orderedItems.withIndex()) {
+            val (block, translated) = pair
+            val revealDelay = (index * staggerStepMs).coerceAtMost(maxStaggerMs)
             val backgroundColor = sampleBackgroundColor(screenshot, block.bounds)
             // Cap width by remaining screen space from this block's left
             // edge, not by the original element's width - a narrow icon
@@ -946,9 +1108,25 @@ class FloatingBubbleService : Service() {
                 y = block.bounds.top
             }
 
+            // Start invisible and slightly shrunk, then pop in on its own
+            // delayed schedule - each label animates independently, which
+            // is what creates the wave effect across the whole set.
+            label.alpha = 0f
+            label.scaleX = 0.85f
+            label.scaleY = 0.85f
+
             windowManager.addView(label, params)
             attachLabelTouchListener(label, params)
             translatedLabelViews.add(label to params)
+
+            label.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setStartDelay(revealDelay)
+                .setDuration(220L)
+                .setInterpolator(android.view.animation.OvershootInterpolator(1.3f))
+                .start()
         }
 
         overlayIsShowing = true
