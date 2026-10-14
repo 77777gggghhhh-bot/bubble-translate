@@ -19,23 +19,49 @@ class TranslationAccessibilityService : AccessibilityService() {
     companion object {
         var instance: TranslationAccessibilityService? = null
             private set
+        private const val MAX_LOG_LINES = 80
+        // Set by FloatingBubbleService while the bubble is running, so
+        // this service can let it know the moment the user lands on a
+        // new screen - the hook behind the "foreign text detected" nudge,
+        // instead of the user having to manually open the bubble on every
+        // single screen just to find out whether there's anything to
+        // translate (inspired by Pixel's Live Translate, which prompts
+        // automatically rather than waiting to be asked).
+        var onForegroundScreenChanged: (() -> Unit)? = null
     }
 
     // Not private anymore: FloatingBubbleService uses this to log what
     // OCR/accessibility actually detected each time you translate, so you
     // can check the "Last crash" screen to see exactly what was found
     // versus missed - real visibility instead of guessing.
+    //
+    // Bounded + session-marked: this used to append forever with no cap,
+    // so "Last crash" grew into weeks of unrelated history before today's
+    // actual test - scrolling past old entries to find what just happened
+    // was a real, repeated cost during development. Now only the most
+    // recent MAX_LOG_LINES lines are kept (plenty for a full testing
+    // session), and each fresh launch stamps a clear banner so it's
+    // obvious at a glance where "today" starts versus older runs still in
+    // the window.
     fun log(message: String) {
         try {
             val prefs = getSharedPreferences("crash_log", Context.MODE_PRIVATE)
             val existing = prefs.getString("last_crash", "") ?: ""
-            prefs.edit().putString("last_crash", "$existing\n[${System.currentTimeMillis()}] $message").commit()
+            val updated = "$existing\n[${System.currentTimeMillis()}] $message"
+            val lines = updated.split("\n")
+            val trimmed = if (lines.size > MAX_LOG_LINES) {
+                lines.takeLast(MAX_LOG_LINES).joinToString("\n")
+            } else {
+                updated
+            }
+            prefs.edit().putString("last_crash", trimmed).commit()
         } catch (e: Exception) { }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        log("────────── new session ──────────")
         log("Service CONNECTED")
     }
 
@@ -49,7 +75,16 @@ class TranslationAccessibilityService : AccessibilityService() {
         log("Service INTERRUPTED")
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // Only a real screen change (switched app, opened a new
+        // activity) - not every minor content tweak within the same
+        // screen (a like-count ticking up, a typing indicator), which
+        // would fire constantly and make the nudge check run far more
+        // often than it needs to.
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            onForegroundScreenChanged?.invoke()
+        }
+    }
 
     fun extractVisibleText(): List<ScreenTextBlock> {
         val root = rootInActiveWindow ?: return emptyList()
